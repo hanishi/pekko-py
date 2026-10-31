@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncGenerator
 
 import pytest
 
@@ -15,6 +16,7 @@ from ohra.stream import (
     Sink,
     Source,
 )
+from ohra.stream import materializer as materializer_module
 from ohra.testkit import ActorTestKit
 from ..util import eventually
 
@@ -27,6 +29,54 @@ async def test_terminate_fails_running_streams():
         await kit.system.when_terminated()
     with pytest.raises(AbruptStageTerminationError):
         await fut
+
+
+async def test_terminate_waits_for_a_stream_to_release_what_it_holds():
+    log: list[str] = []
+    opened = asyncio.Event()
+
+    async def connection() -> AsyncGenerator[int, None]:
+        opened.set()
+        try:
+            while True:
+                yield 1
+                await asyncio.sleep(0.01)
+        finally:
+            await asyncio.sleep(0.05)  # an orderly close, such as a client's
+            log.append("closed")
+
+    kit = ActorTestKit()
+    async with kit:
+        Source.from_async_iterable(connection).run_with(Sink.ignore(), kit.system)
+        await opened.wait()
+    assert log == ["closed"]  # when_terminated() came after the close, not before it
+
+
+async def test_terminate_cancels_a_stream_cleanup_that_does_not_finish(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(materializer_module, "TEARDOWN_TIMEOUT", 0.05)
+    log: list[str] = []
+    opened = asyncio.Event()
+
+    async def stuck() -> AsyncGenerator[int, None]:
+        opened.set()
+        try:
+            while True:
+                yield 1
+                await asyncio.sleep(0.01)
+        finally:
+            try:
+                await asyncio.Event().wait()  # a close that never returns
+            except asyncio.CancelledError:
+                log.append("cancelled")
+                raise
+
+    kit = ActorTestKit()
+    async with kit:
+        Source.from_async_iterable(stuck).run_with(Sink.ignore(), kit.system)
+        await opened.wait()
+    assert log == ["cancelled"]  # terminate() returned, and nothing outlives it
 
 
 async def test_run_after_terminate_raises():

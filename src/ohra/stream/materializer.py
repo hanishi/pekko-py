@@ -2,16 +2,20 @@
 ``/system/Materializers/StreamSupervisor`` on first use and one child of it per run. The child
 drives the sink with ``pipe_to_self`` and stops when the stream ends; when the system terminates,
 stopping the child cancels the drive, which aborts the run (``_Ctx.abort``) so the sink fails its
-pending materialized value with ``AbruptStageTerminationError``. If the child stops before the
-drive's first step, the materializer aborts the run itself."""
+pending materialized value with ``AbruptStageTerminationError``. The child's stop waits for the
+stream to tear down, up to ``TEARDOWN_TIMEOUT``, so ``terminate()`` returns after every source has
+run its cleanup. If the child stops before the drive's first step, the materializer aborts the run
+itself."""
 
 from __future__ import annotations
 
+import asyncio
 import weakref
 from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING, Any
 
 from ..behavior import Behavior, Behaviors
+from ..signals import PostStop, Signal
 from .dsl import _Ctx  # pyright: ignore[reportPrivateUsage]
 
 if TYPE_CHECKING:
@@ -19,6 +23,10 @@ if TYPE_CHECKING:
     from ..context import ActorContext
     from ..system import ActorSystem
     from .dsl import RunnableGraph
+
+# How long a run's actor, when stopped, waits for the stream's cleanup (a source's ``finally``,
+# say) before cancelling it a second time; as remoting's shutdown-flush-timeout
+TEARDOWN_TIMEOUT = 1.0
 
 _materializers: weakref.WeakKeyDictionary[ActorSystem[Any], Materializer] = (
     weakref.WeakKeyDictionary()
@@ -81,7 +89,21 @@ def _child(parent: ActorCell[Any], name: str) -> ActorCell[Any]:
 
 def _run(start: Callable[[], Coroutine[Any, Any, None]]) -> Behavior[_Stop]:
     def setup(ctx: ActorContext[_Stop]) -> Behavior[_Stop]:
-        ctx.pipe_to_self(start(), lambda _: _Stop())
-        return Behaviors.receive_message(lambda _: Behaviors.stopped())
+        drive = asyncio.ensure_future(start())
+        ctx.pipe_to_self(drive, lambda _: _Stop())
+
+        async def on_signal(ctx: ActorContext[_Stop], sig: Signal) -> Behavior[_Stop]:
+            if sig is PostStop:  # stopping cancelled the drive: wait until it has torn down
+                done, _ = await asyncio.wait((drive,), timeout=TEARDOWN_TIMEOUT)
+                if not done:
+                    ctx.log.warning(
+                        "stream cleanup still running after %s s: cancelling it again",
+                        TEARDOWN_TIMEOUT,
+                    )
+                    drive.cancel()
+                    await asyncio.wait((drive,))
+            return Behaviors.same
+
+        return Behaviors.receive_message(lambda _: Behaviors.stopped()).receive_signal(on_signal)
 
     return Behaviors.setup(setup)

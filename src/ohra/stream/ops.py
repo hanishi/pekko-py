@@ -608,12 +608,15 @@ def merge_op[T](other: Source[T, Any], eager_complete: bool) -> Op[T, T]:
                             wake.clear()
                             await wake.wait()
                         item = arrived.popleft()
+                        if isinstance(item, Exception):
+                            raise item
+                        if eager_complete and (item is None or None in arrived):
+                            # as Pekko's Merge: the completion cancels the other input, and the
+                            # element it had pending is discarded (an input completes only
+                            # once its own element is taken)
+                            return
                         if item is None:
                             running -= 1
-                            if eager_complete:
-                                return  # elements still pending are dropped, as in Pekko
-                        elif isinstance(item, Exception):
-                            raise item
                         else:
                             x, taken = item
                             taken.set_result(None)

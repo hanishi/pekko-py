@@ -190,7 +190,7 @@ async def test_a_stream_between_two_queues(testkit: ActorTestKit):
 
 - **`offer`** answers once the element is in the buffer: `Enqueued` (with a buffer, a drop strategy makes room by dropping another element), `Dropped` (with `buffer_size=0` under a drop strategy, or while the queue is completing), `QueueClosed` (the stream is over) or `QueueOfferResult.Failure(cause)`. Under `OverflowStrategy.backpressure` it waits while the buffer is full. Only one offer may wait at a time; a second raises `RuntimeError`, as in Pekko.
 - **`complete()`** ends the stream once the buffer is drained, `fail(exc)` fails it, and `watch_completion()` is a future of the end.
-- **`pull()`** returns the next element, `None` at the end, or raises the stream's failure. `Sink.queue` pulls upstream only when `pull` is called, and a `SinkQueue` is also an async iterator, so `async for x in outbox` reads it to the end. `cancel()` cancels the stream.
+- **`pull()`** returns the next element, `None` at the end, or raises the stream's failure. A stream that carries `None` elements is read with `async for` or `await anext(outbox, default)`, which tell a `None` element from the end. `Sink.queue` pulls upstream only when `pull` is called, and a `SinkQueue` is also an async iterator, so `async for x in outbox` reads it to the end. `cancel()` cancels the stream.
 - **Annotate the source,** as `orders: Source[str, SourceQueue[str]] = ...`, since nothing in `Source.queue(...)` names the element type.
 
 ### Time
@@ -337,6 +337,7 @@ async def test_terminate_fails_a_stream_that_is_still_running():
 
 - **Every materialized future that hasn't completed fails** with `AbruptStageTerminationError`, Pekko's `AbruptStageTerminationException`. That covers `Sink.seq` and the other future sinks, `watch_termination`, `SourceQueue.watch_completion()` and a waiting `SinkQueue.pull()`.
 - **The stages are cancelled.** Calls in flight in `map_async` are cancelled, timers are cancelled, an `ActorSource` stops taking tells, and an `ActorSink` tells its target `on_failure_message(AbruptStageTerminationError(...))`.
+- **`terminate()` waits for the stream to tear down.** The stream is cancelled once, where it is waiting, as any cancelled task is, and its cleanup then runs: a source's `finally`, such as closing a connection, finishes before `when_terminated()` resolves. A cleanup still running after 1 s (`ohra.stream.materializer.TEARDOWN_TIMEOUT`) is logged and cancelled again, so a close that honors cancellation cannot hold `terminate()` up.
 - **`run()` on a terminated system raises `RuntimeError`.** Streams started during the shutdown phases still run until `/system` stops.
 - **To end a stream cleanly, end it before `/system` stops:** complete its source, throw its kill switch, or add a task to a coordinated shutdown phase that does so and waits for it. `ohra.ext.fastapi` drains its WebSockets that way, in the `service-stop` phase.
 

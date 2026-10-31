@@ -28,10 +28,19 @@ async def test_sink_queue_async_for_collects_all():
         assert [x async for x in q] == [1, 2, 3]
 
 
-async def test_sink_queue_pull_returns_none_elements_apart_from_the_end():
+async def test_iterating_a_sink_queue_keeps_none_elements_apart_from_the_end():
     async with ActorTestKit() as kit:
         q = Source.from_iterable([1, None]).run_with(Sink.queue(), kit.system)
         assert [x async for x in q] == [1, None]
+
+
+async def test_anext_with_a_default_tells_a_none_element_from_the_end():
+    # pull() returns None for both, as head_option does; anext(q, default) does not
+    end = object()
+    async with ActorTestKit() as kit:
+        q = Source.from_iterable([None]).run_with(Sink.queue(), kit.system)
+        assert await anext(q, end) is None
+        assert await anext(q, end) is end
 
 
 async def test_sink_queue_pull_raises_on_failure():

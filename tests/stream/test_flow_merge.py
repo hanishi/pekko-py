@@ -57,6 +57,38 @@ async def test_merge_eager_complete():
         assert log == ["closed"]
 
 
+async def test_merge_eager_complete_discards_the_other_inputs_pending_element():
+    # Pekko's FlowMergeSpec "not try to grab from a closed input previously enqueued": the
+    # completion cancels the other input, and the element it had pending is not emitted
+    finished = asyncio.Event()
+
+    async def other() -> AsyncGenerator[str, None]:
+        yield "b1"
+        finished.set()  # the first input completes, behind b2
+        yield "b2"  # pulled as soon as b1 is taken, and pending while nobody pulls
+        await asyncio.Event().wait()
+
+    completed = asyncio.Event()
+
+    async def first() -> AsyncGenerator[str, None]:
+        try:
+            await finished.wait()
+            return
+            yield
+        finally:
+            completed.set()  # in the step that hands the merge its completion
+
+    async with ActorTestKit() as kit:
+        out = (
+            Source.from_async_iterable(first)
+            .merge(Source.from_async_iterable(other), eager_complete=True)
+            .run_with(Sink.queue(), kit.system)
+        )
+        assert await out.pull() == "b1"
+        await completed.wait()  # b2, then the completion, are waiting in the merge
+        assert [x async for x in out] == []
+
+
 async def test_merge_failure_cancels_other():
     log: list[str] = []
     started = asyncio.Event()

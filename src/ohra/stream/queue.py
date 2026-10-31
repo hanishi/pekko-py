@@ -321,7 +321,9 @@ class SinkQueue[T]:
         self._over = False
 
     async def pull(self) -> T | None:
-        """The next element; ``None`` at completion; raises the stream's failure."""
+        """The next element; ``None`` at completion; raises the stream's failure. A ``None``
+        element looks like the end here: read such a stream with ``async for`` or
+        ``anext(queue, default)``."""
         elem = await self._next()
         return None if elem is _END else elem
 

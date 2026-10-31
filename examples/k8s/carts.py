@@ -157,7 +157,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         yield
 
 
-app = FastAPI(title="carts", lifespan=lifespan)
+app = FastAPI(title="carts", lifespan=lifespan, exception_handlers=actors.exception_handlers)
 
 # --- HTTP ----------------------------------------------------------------------------------------
 

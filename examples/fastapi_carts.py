@@ -105,7 +105,11 @@ type RegionCmd = ShardingEnvelope[CartCmd] | GetShardRegionState
 actors = Actors(
     Sharding.init(Entity(Cart, cart_entity).with_passivate_after(IDLE_TIMEOUT)), "carts"
 )
-app = FastAPI(title="carts", lifespan=actors.lifespan)
+app = FastAPI(
+    title="carts",
+    lifespan=actors.lifespan,
+    exception_handlers=actors.exception_handlers,
+)
 
 
 class Item(BaseModel):

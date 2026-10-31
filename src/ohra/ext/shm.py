@@ -9,8 +9,10 @@ not own it use ``with handle.open() as arr:`` and leave the segment alone.
 
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import dataclass
+from multiprocessing import resource_tracker
 from multiprocessing.shared_memory import SharedMemory
 from types import TracebackType
 from typing import Any
@@ -18,10 +20,18 @@ from typing import Any
 import numpy as np
 from numpy.typing import DTypeLike, NDArray
 
-# Python 3.13+: keep the resource tracker out of it. Ownership is explicit here, and the
-# tracker would otherwise unlink a segment when a process that merely attached exits,
-# or warn about a segment that another process unlinked. On 3.12 expect such warnings.
+# Keep the resource tracker out of it. Ownership is explicit here, and the tracker would
+# otherwise unlink a segment when a process that merely attached exits, or warn about a
+# segment that another process unlinked. 3.13 has track=False; before it, each segment
+# created or opened is unregistered again (bpo-38119). Only POSIX has the tracker.
 _KW: dict[str, Any] = {"track": False} if sys.version_info >= (3, 13) else {}
+_UNTRACK = sys.version_info < (3, 13) and os.name == "posix"
+
+
+def _untracked(seg: SharedMemory) -> SharedMemory:
+    if _UNTRACK:
+        resource_tracker.unregister("/" + seg.name, "shared_memory")
+    return seg
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,7 +44,8 @@ class SharedArray:
     def empty(shape: tuple[int, ...], dtype: DTypeLike = np.float64) -> SharedArray:
         """Allocate a segment. Fill it through ``open()``; nothing is copied."""
         dt = np.dtype(dtype)
-        seg = SharedMemory(create=True, size=max(1, int(np.prod(shape)) * dt.itemsize), **_KW)
+        size = max(1, int(np.prod(shape)) * dt.itemsize)
+        seg = _untracked(SharedMemory(create=True, size=size, **_KW))
         try:
             return SharedArray(seg.name, tuple(shape), dt.str)
         finally:
@@ -55,7 +66,7 @@ class SharedArray:
 
     def unlink(self) -> None:
         """Free the segment. Only the owner calls this, exactly once."""
-        SharedMemory(self.name, **_KW).unlink()
+        SharedMemory(self.name, **_KW).unlink()  # unlink() unregisters what this registers
 
 
 class _View:
@@ -66,7 +77,7 @@ class _View:
         self._writeable = writeable
 
     def __enter__(self) -> NDArray[Any]:
-        self._seg = SharedMemory(self._handle.name, **_KW)
+        self._seg = _untracked(SharedMemory(self._handle.name, **_KW))
         self._arr: NDArray[Any] = np.ndarray(
             self._handle.shape, np.dtype(self._handle.dtype), buffer=self._seg.buf
         )

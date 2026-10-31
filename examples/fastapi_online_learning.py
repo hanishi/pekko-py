@@ -298,7 +298,11 @@ def service() -> Behavior[Cmd]:
 
 
 actors = Actors(service(), "online")
-app = FastAPI(title="online learning", lifespan=actors.lifespan)
+app = FastAPI(
+    title="online learning",
+    lifespan=actors.lifespan,
+    exception_handlers=actors.exception_handlers,
+)
 
 
 class Features(BaseModel):

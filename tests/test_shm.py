@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
+import sys
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 
@@ -47,6 +49,25 @@ def test_another_process_reads_the_same_bytes():
     try:
         with ProcessPoolExecutor(1) as pool:
             assert pool.submit(total_in_worker, handle).result() == 10_000.0
+    finally:
+        handle.unlink()
+
+
+def test_a_process_that_only_reads_leaves_the_segment_to_its_owner():
+    # a separate interpreter has a resource tracker of its own, which on 3.12 unlinked every
+    # segment the process attached when it exited
+    handle = SharedArray.create(np.ones(10))
+    try:
+        reader = (
+            "import sys; from ohra.ext.shm import SharedArray\n"
+            f"with SharedArray({handle.name!r}, (10,), {handle.dtype!r}).open() as arr:\n"
+            "    sys.exit(0 if arr.sum() == 10 else 1)"
+        )
+        done = subprocess.run([sys.executable, "-c", reader], capture_output=True, text=True)
+        assert done.returncode == 0, done.stderr
+        assert "leaked" not in done.stderr
+        with handle.open() as arr:
+            assert arr.sum() == 10
     finally:
         handle.unlink()
 

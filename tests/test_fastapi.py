@@ -8,8 +8,10 @@ import dataclasses
 import gc
 import importlib.util
 import inspect
+import logging
 from dataclasses import dataclass
-from collections.abc import Callable
+from collections.abc import AsyncGenerator, Callable
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, cast
 
@@ -53,7 +55,7 @@ async def greeter(msg: Cmd) -> Behavior[Cmd]:
 
 def make_app() -> tuple[FastAPI, Actors[Cmd]]:
     actors = Actors(greeter, "web")
-    app = FastAPI(lifespan=actors.lifespan)
+    app = FastAPI(lifespan=actors.lifespan, exception_handlers=actors.exception_handlers)
 
     @app.get("/greet/{name}")
     async def greet(name: str, system: ActorSystem[Cmd] = actors.depends()) -> dict[str, str]:
@@ -73,17 +75,57 @@ async def test_route_asks_the_system_through_the_dependency():
             r = await client.get("/greet/pekko")
         assert r.status_code == 200
         assert r.json() == {"text": "hello pekko"}
-        assert actors.system.is_terminated is False
-    assert actors.system.is_terminated is True
+        system = actors.system
+        assert system.is_terminated is False
+    assert system.is_terminated is True
+
+
+@asynccontextmanager
+async def served(app: FastAPI) -> AsyncGenerator[None]:
+    """Run the lifespan through the app, as a server does: Starlette builds the app's
+    middleware, exception handlers included, on that first call."""
+    events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    sent: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def send(message: Any) -> None:
+        await sent.put(message)
+
+    scope = {"type": "lifespan", "asgi": {"version": "3.0"}, "state": {}}
+    running = asyncio.create_task(app(scope, events.get, send))
+    await events.put({"type": "lifespan.startup"})
+    try:
+        assert (await sent.get())["type"] == "lifespan.startup.complete"
+        yield
+    finally:
+        await events.put({"type": "lifespan.shutdown"})
+        await running
 
 
 async def test_ask_timeout_is_a_504():
     app, _ = make_app()
-    async with app.router.lifespan_context(app):
+    async with served(app):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
             r = await client.get("/stall")
     assert r.status_code == 504
     assert "timed out" in r.json()["detail"]
+
+
+async def test_an_app_without_the_exception_handlers_is_warned_about(
+    caplog: pytest.LogCaptureFixture,
+):
+    actors = Actors(greeter, "web")
+    with caplog.at_level(logging.WARNING, logger="ohra.ext.fastapi"):
+        async with served(FastAPI(lifespan=actors.lifespan)):
+            pass
+    assert any("exception_handlers=actors.exception_handlers" in r.message for r in caplog.records)
+
+
+async def test_the_system_is_an_error_after_shutdown():
+    app, actors = make_app()
+    async with app.router.lifespan_context(app):
+        pass
+    with pytest.raises(RuntimeError):
+        _ = actors.system
 
 
 def test_system_before_startup_is_an_error():
@@ -98,7 +140,7 @@ async def test_system_settings_reach_the_actor_system():
     settings = CoordinatedShutdownSettings(default_phase_timeout=1.5)
     # address=, cluster=, management= pass the same way
     actors = Actors(greeter, "web", shutdown=settings)
-    app = FastAPI(lifespan=actors.lifespan)
+    app = FastAPI(lifespan=actors.lifespan, exception_handlers=actors.exception_handlers)
     async with app.router.lifespan_context(app):
         assert actors.system.coordinated_shutdown.settings is settings
 
@@ -252,7 +294,7 @@ async def test_websocket_relays_frames_both_ways():
     from fastapi import WebSocketDisconnect
 
     actors = Actors(Behaviors.ignore, "ws")
-    async with actors.lifespan(FastAPI()):
+    async with actors.lifespan(FastAPI(exception_handlers=actors.exception_handlers)):
         ws = FakeSocket()
         connection = asyncio.create_task(actors.websocket(ws.socket(), echo, Said))
         ws.incoming.put_nowait("hi")
@@ -266,7 +308,7 @@ async def test_closing_the_socket_stops_the_actor():
 
     actors = Actors(Behaviors.ignore, "ws")
     stopped = asyncio.Event()
-    async with actors.lifespan(FastAPI()):
+    async with actors.lifespan(FastAPI(exception_handlers=actors.exception_handlers)):
         ws = FakeSocket()
         connection = asyncio.create_task(
             actors.websocket(ws.socket(), lambda out: echo(out, stopped), Said)
@@ -278,7 +320,7 @@ async def test_closing_the_socket_stops_the_actor():
 
 async def test_an_actor_that_stops_closes_the_socket_after_its_frames():
     actors = Actors(Behaviors.ignore, "ws")
-    async with actors.lifespan(FastAPI()):
+    async with actors.lifespan(FastAPI(exception_handlers=actors.exception_handlers)):
         ws = FakeSocket()
         await actors.websocket(ws.socket(), talker({"n": "1"}, {"n": "2"}), Said)
         assert ws.sent == [{"n": "1"}, {"n": "2"}]
@@ -287,7 +329,7 @@ async def test_an_actor_that_stops_closes_the_socket_after_its_frames():
 
 async def test_overflow_closes_with_1008():
     actors = Actors(Behaviors.ignore, "ws")
-    async with actors.lifespan(FastAPI()):
+    async with actors.lifespan(FastAPI(exception_handlers=actors.exception_handlers)):
         ws = FakeSocket()
         frames = [{"n": str(i)} for i in range(3)]
         await actors.websocket(ws.socket(), talker(*frames), Said, buffer_size=1)
@@ -296,7 +338,7 @@ async def test_overflow_closes_with_1008():
 
 async def test_a_receive_failure_in_the_tick_of_an_overflow_is_raised():
     actors = Actors(Behaviors.ignore, "ws")
-    async with actors.lifespan(FastAPI()):
+    async with actors.lifespan(FastAPI(exception_handlers=actors.exception_handlers)):
         ws = FakeSocket()
         ws.incoming.put_nowait(RuntimeError("receive broke"))  # before the route sees the overflow
         frames = [{"n": str(i)} for i in range(3)]
@@ -314,7 +356,7 @@ async def test_a_send_that_fails_ends_the_connection_and_stops_the_actor():
     errors: list[str] = []
     loop.set_exception_handler(lambda _, context: errors.append(str(context["message"])))
     try:
-        async with actors.lifespan(FastAPI()):
+        async with actors.lifespan(FastAPI(exception_handlers=actors.exception_handlers)):
             ws = FakeSocket(WebSocketDisconnect(1006))  # the client's TCP dropped mid-send
             connection = asyncio.create_task(
                 actors.websocket(ws.socket(), lambda out: echo(out, stopped), Said)
@@ -335,7 +377,7 @@ async def test_a_route_cancelled_by_the_server_still_stops_the_actor():
     actors = Actors(Behaviors.ignore, "ws")
     stopped = asyncio.Event()
     scope = anyio.CancelScope()  # how Starlette cancels a route: every later await raises too
-    async with actors.lifespan(FastAPI()):
+    async with actors.lifespan(FastAPI(exception_handlers=actors.exception_handlers)):
         ws = FakeSocket()
 
         async def route() -> None:
@@ -366,7 +408,7 @@ async def test_frames_the_actor_already_has_are_handled_when_the_client_closes()
 
         return on_message
 
-    async with actors.lifespan(FastAPI()):
+    async with actors.lifespan(FastAPI(exception_handlers=actors.exception_handlers)):
         ws = FakeSocket()
         for frame in ("1", "2", "3"):
             ws.incoming.put_nowait(frame)
@@ -379,7 +421,7 @@ async def test_frames_the_actor_already_has_are_handled_when_the_client_closes()
 async def test_terminating_the_system_closes_open_connections():
     actors = Actors(Behaviors.ignore, "ws")
     ws = FakeSocket()
-    async with actors.lifespan(FastAPI()):
+    async with actors.lifespan(FastAPI(exception_handlers=actors.exception_handlers)):
         connection = asyncio.create_task(actors.websocket(ws.socket(), echo, Said))
         ws.incoming.put_nowait("hi")
         await eventually(lambda: ws.sent == [{"echo": "hi"}])
@@ -393,7 +435,7 @@ async def test_an_actor_that_fails_to_start_closes_the_socket():
     def broken(_out: ActorRef[Frame]) -> Behavior[Said]:
         raise ValueError("no such room")
 
-    async with actors.lifespan(FastAPI()):
+    async with actors.lifespan(FastAPI(exception_handlers=actors.exception_handlers)):
         ws = FakeSocket()
         await asyncio.wait_for(actors.websocket(ws.socket(), broken, Said), 1)
         assert ws.closed == 1000
@@ -403,7 +445,7 @@ async def test_a_close_after_the_client_left_is_not_an_error():
     from fastapi import WebSocketDisconnect
 
     actors = Actors(Behaviors.ignore, "ws")
-    async with actors.lifespan(FastAPI()):
+    async with actors.lifespan(FastAPI(exception_handlers=actors.exception_handlers)):
         ws = FakeSocket(close_error=WebSocketDisconnect(1006))
         await actors.websocket(ws.socket(), talker({"n": "1"}), Said)
         assert ws.sent == [{"n": "1"}]
@@ -411,7 +453,7 @@ async def test_a_close_after_the_client_left_is_not_an_error():
 
 async def test_a_frame_in_the_tick_the_server_closes_is_not_an_error():
     actors = Actors(Behaviors.ignore, "ws")
-    async with actors.lifespan(FastAPI()):
+    async with actors.lifespan(FastAPI(exception_handlers=actors.exception_handlers)):
         ws = FakeSocket(frame_on_close="late")
         await actors.websocket(ws.socket(), talker({"n": "1"}), Said)
         assert ws.closed == 1000
@@ -426,7 +468,7 @@ async def test_a_frame_decode_rejects_closes_with_1003_and_stops_the_actor():
             raise ValueError("empty frame")
         return Said(text)
 
-    async with actors.lifespan(FastAPI()):
+    async with actors.lifespan(FastAPI(exception_handlers=actors.exception_handlers)):
         ws = FakeSocket()
         ws.incoming.put_nowait("")
         await actors.websocket(ws.socket(), lambda out: echo(out, stopped), strict)
@@ -436,7 +478,7 @@ async def test_a_frame_decode_rejects_closes_with_1003_and_stops_the_actor():
 
 async def test_a_client_that_stops_reading_is_closed_with_1008():
     actors = Actors(Behaviors.ignore, "ws")
-    async with actors.lifespan(FastAPI()):
+    async with actors.lifespan(FastAPI(exception_handlers=actors.exception_handlers)):
         ws = FakeSocket(sends_block_after=1)
         websocket = actors.websocket(ws.socket(), echo, Said, buffer_size=1)
         connection = asyncio.create_task(websocket)
@@ -468,7 +510,7 @@ async def test_a_connection_while_the_system_shuts_down_is_closed_with_1001():
         return Behaviors.ignore
 
     actors = Actors(guardian, "ws")
-    async with actors.lifespan(FastAPI()):
+    async with actors.lifespan(FastAPI(exception_handlers=actors.exception_handlers)):
         actors.system.terminate()
         await started.wait()  # the guardian is stopping, waiting on its child
         try:
@@ -496,7 +538,7 @@ async def test_an_overflow_after_the_client_left_is_not_an_error():
             raise WebSocketDisconnect(1006)
 
     actors = Actors(Behaviors.ignore, "ws")
-    async with actors.lifespan(FastAPI()):
+    async with actors.lifespan(FastAPI(exception_handlers=actors.exception_handlers)):
         ws = GoneSocket()
 
         def props(out: ActorRef[Frame]) -> Behavior[Said]:
@@ -515,7 +557,7 @@ async def test_a_rejected_frame_in_the_tick_the_server_closes_is_not_an_error():
             raise ValueError("empty frame")
         return Said(text)
 
-    async with actors.lifespan(FastAPI()):
+    async with actors.lifespan(FastAPI(exception_handlers=actors.exception_handlers)):
         ws = FakeSocket(frame_on_close="")
         await actors.websocket(ws.socket(), talker({"n": "1"}), strict)
         assert ws.closed == 1000

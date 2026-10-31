@@ -20,7 +20,7 @@ from ohra import ActorSystem
 from ohra.ext.fastapi import Actors
 
 actors = Actors(cart({}), "shop")  # the actor system lives as long as the app
-app = FastAPI(lifespan=actors.lifespan)
+app = FastAPI(lifespan=actors.lifespan, exception_handlers=actors.exception_handlers)
 
 
 @app.post("/items/{sku}")
@@ -52,6 +52,7 @@ $ curl localhost:8000/cart
 
 - **`Actors(cart({}), "shop")`** takes the same arguments as `ActorSystem`.
 - **`lifespan=actors.lifespan`** lets FastAPI start the system and stop it.
+- **`exception_handlers=actors.exception_handlers`** maps an ask timeout to a 504. Starlette reads the handlers when it builds the app, before the lifespan runs, so they go to `FastAPI(...)`; the lifespan logs a warning when they are missing.
 - **`actors.depends()`** hands each route the system, with its type: `system.ask(GetCart, ...)` returns a `dict[str, int]`, and pyright checks that against the route's return type.
 - **Each request is a message.** Two requests at the same moment still reach the cart one at a time, as in chapter 1.
 - **A cart that does not answer within the timeout** turns into a 504 response.
@@ -65,14 +66,14 @@ $ curl localhost:8000/cart
 
 This integration is not part of Apache Pekko. It is what a Python service over actors otherwise writes by hand.
 
-`ohra.ext.fastapi.Actors` owns an `ActorSystem` for the life of a FastAPI app and hands it to routes as a typed dependency, so `ask` replies are type-checked all the way to the response. An `AskTimeoutError` that escapes a route becomes a 504. Keyword arguments after the name go to `ActorSystem` (`address`, `cluster`, `shutdown`, `management`), so a cluster node can be owned by the app. Needs the `web` extra. To stop taking requests before a cluster node leaves, add a task to the `service-unbind` phase of the coordinated shutdown, and let uvicorn keep its signals: its shutdown should call `system.terminate()` rather than `run_on_signals` taking SIGTERM.
+`ohra.ext.fastapi.Actors` owns an `ActorSystem` for the life of a FastAPI app and hands it to routes as a typed dependency, so `ask` replies are type-checked all the way to the response. With `actors.exception_handlers` passed to `FastAPI`, an `AskTimeoutError` that escapes a route becomes a 504. Keyword arguments after the name go to `ActorSystem` (`address`, `cluster`, `shutdown`, `management`), so a cluster node can be owned by the app. Needs the `web` extra. To stop taking requests before a cluster node leaves, add a task to the `service-unbind` phase of the coordinated shutdown, and let uvicorn keep its signals: its shutdown should call `system.terminate()` rather than `run_on_signals` taking SIGTERM.
 
 ```python
 from fastapi import FastAPI
 from ohra.ext.fastapi import Actors
 
 actors = Actors(counter(), "web")
-app = FastAPI(lifespan=actors.lifespan)
+app = FastAPI(lifespan=actors.lifespan, exception_handlers=actors.exception_handlers)
 
 
 @app.get("/total")
@@ -112,7 +113,7 @@ def echo(out: ActorRef[Frame]) -> Behavior[Said]:
 
 
 actors = Actors(Behaviors.ignore, "echo")
-app = FastAPI(lifespan=actors.lifespan)
+app = FastAPI(lifespan=actors.lifespan, exception_handlers=actors.exception_handlers)
 
 
 @app.websocket("/ws")
@@ -161,7 +162,7 @@ def echo() -> Behavior[Say]:
 
 
 actors = Actors(echo(), "echo")
-app = FastAPI(lifespan=actors.lifespan)
+app = FastAPI(lifespan=actors.lifespan, exception_handlers=actors.exception_handlers)
 
 
 @app.websocket("/ws")

@@ -2,15 +2,16 @@
 dependency.
 
     actors = Actors(guardian, "app")
-    app = FastAPI(lifespan=actors.lifespan)
+    app = FastAPI(lifespan=actors.lifespan, exception_handlers=actors.exception_handlers)
 
     @app.get("/x")
     async def x(system: ActorSystem[Cmd] = actors.depends()) -> ...:
         return await system.ask(..., timeout=1)
 
-An ``AskTimeoutError`` escaping a route becomes a 504. ``actors.websocket`` gives a WebSocket
-route an actor per connection, as Play's ``ActorFlow.actorRef`` does: the route owns the socket and
-the actor only gets ``out``. Requires the ``web`` extra.
+With ``actors.exception_handlers``, an ``AskTimeoutError`` escaping a route becomes a 504.
+``actors.websocket`` gives a WebSocket route an actor per connection, as Play's
+``ActorFlow.actorRef`` does: the route owns the socket and the actor only gets ``out``. Requires
+the ``web`` extra.
 """
 
 from __future__ import annotations
@@ -55,6 +56,9 @@ class Actors[T]:
         self._system: ActorSystem[T] | None = None
         self._connections: dict[ActorRef[Any], asyncio.Task[None]] = {}  # wrapper: its send
         self._draining = False
+        # Starlette copies the handlers when it builds the app, before the lifespan runs, so
+        # they go to FastAPI(...) rather than being added at startup
+        self.exception_handlers: dict[Any, Any] = {AskTimeoutError: _ask_timeout_to_504}
 
     @property
     def system(self) -> ActorSystem[T]:
@@ -67,12 +71,21 @@ class Actors[T]:
 
     @asynccontextmanager
     async def lifespan(self, app: FastAPI) -> AsyncGenerator[None]:
-        app.add_exception_handler(AskTimeoutError, _ask_timeout_to_504)
-        async with ActorSystem(self._guardian, self._name, **self._settings) as system:
-            self._system = system
-            self._draining = False
-            system.coordinated_shutdown.add_task("service-stop", "websockets-drain", self._drain)
-            yield
+        if AskTimeoutError not in app.exception_handlers:
+            _log.warning(
+                "an AskTimeoutError will be a 500, not a 504: pass "
+                "FastAPI(lifespan=actors.lifespan, exception_handlers=actors.exception_handlers)"
+            )
+        try:
+            async with ActorSystem(self._guardian, self._name, **self._settings) as system:
+                self._system = system
+                self._draining = False
+                system.coordinated_shutdown.add_task(
+                    "service-stop", "websockets-drain", self._drain
+                )
+                yield
+        finally:
+            self._system = None
 
     async def _drain(self) -> None:
         """The coordinated shutdown's service-stop phase, as Pekko HTTP's graceful termination:

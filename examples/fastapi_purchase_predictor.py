@@ -498,7 +498,11 @@ def service() -> Behavior[Cmd]:
 
 
 actors = Actors(service(), "shop")
-app = FastAPI(title="purchase predictor", lifespan=actors.lifespan)
+app = FastAPI(
+    title="purchase predictor",
+    lifespan=actors.lifespan,
+    exception_handlers=actors.exception_handlers,
+)
 
 
 class Visit(BaseModel):

@@ -225,7 +225,11 @@ def lobby() -> Behavior[Join]:
 
 
 actors = Actors(lobby(), "chat")
-app = FastAPI(title="chat", lifespan=actors.lifespan)
+app = FastAPI(
+    title="chat",
+    lifespan=actors.lifespan,
+    exception_handlers=actors.exception_handlers,
+)
 
 
 @app.websocket("/ws/{room}/{screen_name}")

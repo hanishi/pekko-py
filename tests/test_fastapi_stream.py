@@ -57,7 +57,7 @@ FRAMES = [{"n": str(i)} for i in range(5)]
 async def test_terminating_the_system_flushes_the_frames_told_then_closes_with_1000():
     actors = Actors(Behaviors.ignore, "ws")
     ws, first_sent = slow_socket()
-    async with actors.lifespan(FastAPI()):
+    async with actors.lifespan(FastAPI(exception_handlers=actors.exception_handlers)):
         connection = asyncio.create_task(
             actors.websocket(ws.socket(), chatty, Said, buffer_size=10)
         )
@@ -76,7 +76,7 @@ class Stop:
 async def test_a_guardian_that_stops_flushes_the_frames_told_then_closes_with_1000():
     actors = Actors(Behaviors.receive_message(lambda _: Behaviors.stopped()), "ws")
     ws, first_sent = slow_socket()
-    async with actors.lifespan(FastAPI()):
+    async with actors.lifespan(FastAPI(exception_handlers=actors.exception_handlers)):
         connection = asyncio.create_task(
             actors.websocket(ws.socket(), chatty, Said, buffer_size=10)
         )
@@ -93,7 +93,7 @@ async def test_terminating_without_the_coordinated_shutdown_drops_the_frames_wit
     actors = Actors(Behaviors.ignore, "ws", shutdown=direct)
     gate = asyncio.Event()
     ws, first_sent = slow_socket(gate)
-    async with actors.lifespan(FastAPI()):
+    async with actors.lifespan(FastAPI(exception_handlers=actors.exception_handlers)):
         connection = asyncio.create_task(
             actors.websocket(ws.socket(), chatty, Said, buffer_size=10)
         )
